@@ -46,7 +46,6 @@ def black_scholes_price(S, K, T, r, sigma, option_type):
         return K * exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
     else:
         return None
-    
 
 
 class SignalDatabase:
@@ -245,12 +244,9 @@ class OptionStrategyBot:
       - Short Strangle: Vende uma call OTM e uma put OTM simultaneamente.
       - Bull Call Spread: Vende uma call OTM e compra outra call com strike maior para proteção.
       - Bear Put Spread: Vende uma put OTM e compra outra put com strike menor para proteção.
-
-    Cada sinal inclui:
-      - Preço calculado utilizando Black–Scholes (com base em S, K, T, r e IV).
-      - Quantidade padrão de operação, definida conforme o ativo.
-      - Armazenamento dos prêmios de cada perna em 'leg_premiums'.
-      - Instruções de rolagem para a próxima expiração.
+      - 16 Delta Short Strangle: Venda de call e put com delta aproximado de 16, vencimento de 45 dias (com diversificação temporal),
+        rolagem 21 dias antes do vencimento, avaliação da margem de manutenção (MM) e realização de lucros quando as opções
+        atingirem 65% de ROI.
     """
 
     def __init__(self, api_key=None, secret=None, quote_currency="USDT", r=0.01):
@@ -265,19 +261,30 @@ class OptionStrategyBot:
         self.quote_currency = quote_currency
         self.r = r
         if api_key and secret:
-            self.exchange = ccxt.bybit({"apiKey": api_key, "secret": secret})
+            try:
+                self.exchange = ccxt.bybit({"apiKey": api_key, "secret": secret})
+                # Tentativa de conexão simples
+                self.exchange.fetch_ticker(f"BTC/{self.quote_currency}")
+                self.api_connected = True
+            except Exception as e:
+                self.api_connected = False
+                print("WARNING: FAILED TO CONNECT TO ACCOUNT. ASSUMING CROSS MARGIN OF $70.00 USDT AND $130.00 IN VARIOUS CRYPTOS.")
         else:
             self.exchange = ccxt.bybit()  # Usa apenas endpoints públicos
+            self.api_connected = False
+            print("WARNING: FAILED TO CONNECT TO ACCOUNT. ASSUMING CROSS MARGIN OF $70.00 USDT AND $130.00 IN VARIOUS CRYPTOS.")
         self.assets = ["BTC", "ETH", "SOL"]
         self.iv_threshold = 0.50
-        self.asset_min_qty = {"BTC": 0.01, "ETH": 0.01, "SOL": 0.1}
+        # Valores mínimos para os ativos:
+        # BTC: 0.01, ETH: 0.01, SOL: 1.0
+        self.asset_min_qty = {"BTC": 0.01, "ETH": 0.01, "SOL": 1.0}
 
     def fetch_underlying_price(self, asset):
         """
         Obtém o preço do ativo subjacente para o par asset/quote_currency.
 
         :param asset: Nome do ativo (ex: 'BTC').
-        :return: Preço atual do ativo ou None se ocorrer erro.
+        :return: Preço atual do ativo ou, em caso de falha de conexão, um preço simulado.
         """
         symbol = f"{asset}/{self.quote_currency}"
         try:
@@ -285,6 +292,10 @@ class OptionStrategyBot:
             return ticker["last"]
         except Exception as e:
             print(f"Erro ao buscar ticker para {symbol}: {e}")
+            if not self.api_connected:
+                fallback_prices = {"BTC": 20000, "ETH": 1500, "SOL": 40}
+                print("WARNING: FAILED TO CONNECT TO ACCOUNT. ASSUMING DEFAULT UNDERLYING PRICE FOR SIMULATION.")
+                return fallback_prices.get(asset, 0)
             return None
 
     def fetch_options_data(self, asset):
@@ -390,40 +401,79 @@ class OptionStrategyBot:
                 leg_premiums = {"sell_call": premium_call, "sell_put": premium_put}
                 sell_call_qty = default_qty
                 sell_put_qty = default_qty
+
                 if premium_call > premium_put * 1.1:
-                    sell_call_qty = default_qty * 1.5
+                    sell_call_qty = default_qty * 2.0
                 elif premium_put > premium_call * 1.1:
-                    sell_put_qty = default_qty * 1.5
-                if (call_to_sell["iv"] + put_to_sell["iv"]) / 2.0 > self.iv_threshold:
-                    roll_instruction = "Fechar posições e montar novo Short Strangle para a próxima expiração."
-                    call_to_sell.update({"quantity": sell_call_qty})
-                    put_to_sell.update({"quantity": sell_put_qty})
-                    signal = {
-                        "strategy": "Short Strangle",
-                        "sell_call": call_to_sell,
-                        "sell_put": put_to_sell,
-                        "expiration": expiration,
-                        "premium": total_premium,
-                        "leg_premiums": leg_premiums,
-                        "rationale": f"IV média acima do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}.",
-                    }
+                    sell_put_qty = default_qty * 2.0
+
+                # Simulação de MM para Short Strangle:
+                risk_call = call_to_sell["strike"] - price
+                risk_put = price - put_to_sell["strike"]
+                risk = max(risk_call, risk_put)
+                margin = risk - total_premium
+
+                if self.api_connected:
+                    margin_percent = (margin / price) * 100
+                    if margin_percent > 55:
+                        signal = {
+                            "asset": asset,
+                            "strategy": "No Trade - Short Strangle",
+                            "expiration": expiration,
+                            "premium": total_premium,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"NOT POSSIBLE: REQUIRED MM {margin_percent:.1f}% exceeds 55%."
+                        }
+                        roll_instruction = ""
+                    else:
+                        roll_instruction = "Fechar posições e montar novo Short Strangle para a próxima expiração."
+                        call_to_sell.update({"quantity": sell_call_qty})
+                        put_to_sell.update({"quantity": sell_put_qty})
+                        signal = {
+                            "asset": asset,
+                            "strategy": "Short Strangle",
+                            "sell_call": call_to_sell,
+                            "sell_put": put_to_sell,
+                            "expiration": expiration,
+                            "premium": total_premium,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"IV média acima do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}."
+                        }
                 else:
-                    roll_instruction = ""
-                    signal = {
-                        "strategy": "No Trade - Short Strangle",
-                        "expiration": expiration,
-                        "premium": total_premium,
-                        "leg_premiums": leg_premiums,
-                        "rationale": f"IV média abaixo do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}.",
-                    }
+                    available_margin = 70 if asset in ["BTC", "ETH"] else 130
+                    if margin > available_margin:
+                        signal = {
+                            "asset": asset,
+                            "strategy": "No Trade - Short Strangle",
+                            "expiration": expiration,
+                            "premium": total_premium,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"NOT POSSIBLE: REQUIRED MARGIN ${margin:.2f}, AVAILABLE ${available_margin:.2f}."
+                        }
+                        roll_instruction = ""
+                    else:
+                        roll_instruction = "Fechar posições e montar novo Short Strangle para a próxima expiração."
+                        call_to_sell.update({"quantity": sell_call_qty})
+                        put_to_sell.update({"quantity": sell_put_qty})
+                        signal = {
+                            "asset": asset,
+                            "strategy": "Short Strangle",
+                            "sell_call": call_to_sell,
+                            "sell_put": put_to_sell,
+                            "expiration": expiration,
+                            "premium": total_premium,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"IV média acima do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}."
+                        }
             else:
                 roll_instruction = ""
                 signal = {
+                    "asset": asset,
                     "strategy": "No Trade - Short Strangle",
                     "expiration": expiration,
                     "premium": 0,
                     "leg_premiums": {},
-                    "rationale": "Opções OTM não disponíveis.",
+                    "rationale": "Opções OTM não disponíveis."
                 }
             signals_list.append((signal, roll_instruction))
         return signals_list
@@ -453,6 +503,7 @@ class OptionStrategyBot:
                 sold_call = next((op for op in sorted_calls if op["strike"] > price), None)
                 if sold_call is None:
                     signal = {
+                        "asset": asset,
                         "strategy": "No Trade - Bull Call Spread",
                         "rationale": "Nenhuma call OTM disponível.",
                         "expiration": expiration,
@@ -465,6 +516,7 @@ class OptionStrategyBot:
                     bought_call = sorted_calls[index + 1]
                 else:
                     signal = {
+                        "asset": asset,
                         "strategy": "No Trade - Bull Call Spread",
                         "rationale": "Não há call para proteção.",
                         "expiration": expiration,
@@ -479,27 +531,73 @@ class OptionStrategyBot:
                 leg_premiums = {"sold_call": sold_call_premium, "bought_call": bought_call_cost}
                 qty = self.asset_min_qty.get(asset, 0.01)
                 if net_credit > price * 0.001:
-                    qty = self.asset_min_qty.get(asset, 0.01) * 1.5
-                sold_call.update({"quantity": qty})
-                bought_call.update({"quantity": qty})
-                roll_instruction = "Fechar a trava de alta e montar nova trava para a próxima expiração."
-                signal = {
-                    "strategy": "Bull Call Spread",
-                    "sell_call": sold_call,
-                    "buy_call": bought_call,
-                    "expiration": expiration,
-                    "premium": net_credit,
-                    "leg_premiums": leg_premiums,
-                    "rationale": f"Crédito líquido: {net_credit:.4f}.",
-                }
+                    qty = self.asset_min_qty.get(asset, 0.01) * 2.0
+
+                # Simulação de MM para Bull Call Spread:
+                spread_width = bought_call["strike"] - sold_call["strike"]
+                margin = spread_width - net_credit
+
+                if self.api_connected:
+                    margin_percent = (margin / price) * 100
+                    if margin_percent > 55:
+                        signal = {
+                            "asset": asset,
+                            "strategy": "No Trade - Bull Call Spread",
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"NOT POSSIBLE: REQUIRED MM {margin_percent:.1f}% exceeds 55%."
+                        }
+                        roll_instruction = ""
+                    else:
+                        sold_call.update({"quantity": qty})
+                        bought_call.update({"quantity": qty})
+                        roll_instruction = "Fechar a trava de alta e montar nova trava para a próxima expiração."
+                        signal = {
+                            "asset": asset,
+                            "strategy": "Bull Call Spread",
+                            "sell_call": sold_call,
+                            "buy_call": bought_call,
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"Crédito líquido: {net_credit:.4f}."
+                        }
+                else:
+                    available_margin = 70 if asset in ["BTC", "ETH"] else 130
+                    if margin > available_margin:
+                        signal = {
+                            "asset": asset,
+                            "strategy": "No Trade - Bull Call Spread",
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"NOT POSSIBLE: REQUIRED MARGIN ${margin:.2f}, AVAILABLE ${available_margin:.2f}."
+                        }
+                        roll_instruction = ""
+                    else:
+                        sold_call.update({"quantity": qty})
+                        bought_call.update({"quantity": qty})
+                        roll_instruction = "Fechar a trava de alta e montar nova trava para a próxima expiração."
+                        signal = {
+                            "asset": asset,
+                            "strategy": "Bull Call Spread",
+                            "sell_call": sold_call,
+                            "buy_call": bought_call,
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"Crédito líquido: {net_credit:.4f}."
+                        }
             else:
                 roll_instruction = ""
                 signal = {
+                    "asset": asset,
                     "strategy": "No Trade - Bull Call Spread",
                     "expiration": expiration,
                     "premium": 0,
                     "leg_premiums": {},
-                    "rationale": "Dados insuficientes de opções.",
+                    "rationale": "Dados insuficientes de opções."
                 }
             signals_list.append((signal, roll_instruction))
         return signals_list
@@ -529,6 +627,7 @@ class OptionStrategyBot:
                 sold_put = next((op for op in sorted_puts if op["strike"] < price), None)
                 if sold_put is None:
                     signal = {
+                        "asset": asset,
                         "strategy": "No Trade - Bear Put Spread",
                         "rationale": "Nenhuma put OTM disponível.",
                         "expiration": expiration,
@@ -541,6 +640,7 @@ class OptionStrategyBot:
                     bought_put = sorted_puts[index + 1]
                 else:
                     signal = {
+                        "asset": asset,
                         "strategy": "No Trade - Bear Put Spread",
                         "rationale": "Não há put para proteção.",
                         "expiration": expiration,
@@ -556,27 +656,181 @@ class OptionStrategyBot:
                 qty = self.asset_min_qty.get(asset, 0.01)
                 if net_credit > price * 0.001:
                     qty = self.asset_min_qty.get(asset, 0.01) * 1.5
-                sold_put.update({"quantity": qty})
-                bought_put.update({"quantity": qty})
-                roll_instruction = "Fechar a trava de baixa e montar nova trava para a próxima expiração."
-                signal = {
-                    "strategy": "Bear Put Spread",
-                    "sell_put": sold_put,
-                    "buy_put": bought_put,
-                    "expiration": expiration,
-                    "premium": net_credit,
-                    "leg_premiums": leg_premiums,
-                    "rationale": f"Crédito líquido: {net_credit:.4f}.",
-                }
+
+                # Simulação de MM para Bear Put Spread:
+                spread_width = sold_put["strike"] - bought_put["strike"]
+                margin = spread_width - net_credit
+
+                if self.api_connected:
+                    margin_percent = (margin / price) * 100
+                    if margin_percent > 55:
+                        signal = {
+                            "asset": asset,
+                            "strategy": "No Trade - Bear Put Spread",
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"NOT POSSIBLE: REQUIRED MM {margin_percent:.1f}% exceeds 55%."
+                        }
+                        roll_instruction = ""
+                    else:
+                        sold_put.update({"quantity": qty})
+                        bought_put.update({"quantity": qty})
+                        roll_instruction = "Fechar a trava de baixa e montar nova trava para a próxima expiração."
+                        signal = {
+                            "asset": asset,
+                            "strategy": "Bear Put Spread",
+                            "sell_put": sold_put,
+                            "buy_put": bought_put,
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"Crédito líquido: {net_credit:.4f}."
+                        }
+                else:
+                    available_margin = 70 if asset in ["BTC", "ETH"] else 130
+                    if margin > available_margin:
+                        signal = {
+                            "asset": asset,
+                            "strategy": "No Trade - Bear Put Spread",
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"NOT POSSIBLE: REQUIRED MARGIN ${margin:.2f}, AVAILABLE ${available_margin:.2f}."
+                        }
+                        roll_instruction = ""
+                    else:
+                        sold_put.update({"quantity": qty})
+                        bought_put.update({"quantity": qty})
+                        roll_instruction = "Fechar a trava de baixa e montar nova trava para a próxima expiração."
+                        signal = {
+                            "asset": asset,
+                            "strategy": "Bear Put Spread",
+                            "sell_put": sold_put,
+                            "buy_put": bought_put,
+                            "expiration": expiration,
+                            "premium": net_credit,
+                            "leg_premiums": leg_premiums,
+                            "rationale": f"Crédito líquido: {net_credit:.4f}."
+                        }
             else:
                 roll_instruction = ""
                 signal = {
+                    "asset": asset,
                     "strategy": "No Trade - Bear Put Spread",
                     "expiration": expiration,
                     "premium": 0,
                     "leg_premiums": {},
-                    "rationale": "Dados insuficientes de opções.",
+                    "rationale": "Dados insuficientes de opções."
                 }
+            signals_list.append((signal, roll_instruction))
+        return signals_list
+
+    def analyze_and_generate_16delta_short_strangle(self, asset):
+        """
+        Analisa o ativo para gerar sinais da estratégia 16 Delta Short Strangle para vencimentos fixos.
+        
+        Estratégia:
+          - Venda simultânea de uma call e uma put com delta aproximado de 16% (ou seja, opções OTM).
+          - Vencimento fixo de 45 dias a contar da abertura.
+          - Possibilidade de diversificação temporal: abertura de posições 5 dias antes e 5 dias depois.
+          - Rolagem: Iniciar 21 dias antes do vencimento para evitar risco de gamma.
+          - Margem de manutenção: Até 50% (com tolerância de 10%, até 55%), ou entre 35 a 40% se a volatilidade implícita estiver baixa.
+          - Realização de lucros: Renda perpétua com rolagem ou encerramento quando as opções atingirem 65% de ROI.
+        
+        :param asset: Nome do ativo (ex: 'BTC').
+        :return: Lista de tuplas (sinal, roll_instruction) para cada vencimento definido.
+        """
+        tz = pytz.timezone("America/Recife")
+        now = datetime.now(tz)
+        signals_list = []
+        # Definindo vencimentos: principal 45 dias, diversificados 40 e 50 dias a partir de hoje.
+        expirations = [
+            (now + timedelta(days=45)).strftime("%Y-%m-%d"),
+            (now + timedelta(days=40)).strftime("%Y-%m-%d"),
+            (now + timedelta(days=50)).strftime("%Y-%m-%d"),
+        ]
+        price = self.fetch_underlying_price(asset)
+        if price is None:
+            return []
+        # Simula strikes para delta ~16: para calls, strike = 1.15 * preço; para puts, strike = 0.85 * preço.
+        call_strike = price * 1.15
+        put_strike = price * 0.85
+        # Simula volatilidade implícita específica para essa estratégia.
+        call_iv = 0.50
+        put_iv = 0.50
+        # Define a quantidade padrão para a estratégia.
+        default_qty = self.asset_min_qty.get(asset, 0.01)
+        for exp in expirations:
+            T = self.time_to_expiration(exp)
+            premium_call = black_scholes_price(price, call_strike, T, self.r, call_iv, "call")
+            premium_put = black_scholes_price(price, put_strike, T, self.r, put_iv, "put")
+            total_premium = premium_call + premium_put
+            leg_premiums = {"sell_call": premium_call, "sell_put": premium_put}
+            qty_call = default_qty
+            qty_put = default_qty
+            # Simulação de MM para 16 Delta Short Strangle:
+            risk_call = call_strike - price
+            risk_put = price - put_strike
+            risk = max(risk_call, risk_put)
+            margin = risk - total_premium
+
+            if self.api_connected:
+                margin_percent = (margin / price) * 100
+                if margin_percent > 55:
+                    signal = {
+                        "asset": asset,
+                        "strategy": "No Trade - 16 Delta Short Strangle",
+                        "expiration": exp,
+                        "premium": total_premium,
+                        "leg_premiums": leg_premiums,
+                        "rationale": f"NOT POSSIBLE: REQUIRED MM {margin_percent:.1f}% exceeds 55%."
+                    }
+                    roll_instruction = ""
+                else:
+                    roll_instruction = "Rolagem: Iniciar rolagem 21 dias antes do vencimento."
+                    signal = {
+                        "asset": asset,
+                        "strategy": "16 Delta Short Strangle",
+                        "sell_call": {"strike": call_strike, "iv": call_iv, "symbol": f"{asset}_CALL_16D", "quantity": qty_call},
+                        "sell_put": {"strike": put_strike, "iv": put_iv, "symbol": f"{asset}_PUT_16D", "quantity": qty_put},
+                        "expiration": exp,
+                        "premium": total_premium,
+                        "leg_premiums": leg_premiums,
+                        "rationale": (
+                            "16 Delta Short Strangle: Venda de call e put com delta ~16, vencimento de 45 dias "
+                            "(ou diversificação 5 dias antes/depois), rolagem 21 dias antes, "
+                            "margem conforme VI e ROI de 65% para realização de lucros."
+                        ),
+                    }
+            else:
+                available_margin = 70 if asset in ["BTC", "ETH"] else 130
+                if margin > available_margin:
+                    signal = {
+                        "asset": asset,
+                        "strategy": "No Trade - 16 Delta Short Strangle",
+                        "expiration": exp,
+                        "premium": total_premium,
+                        "leg_premiums": leg_premiums,
+                        "rationale": f"NOT POSSIBLE: REQUIRED MARGIN ${margin:.2f}, AVAILABLE ${available_margin:.2f}."
+                    }
+                    roll_instruction = ""
+                else:
+                    roll_instruction = "Rolagem: Iniciar rolagem 21 dias antes do vencimento."
+                    signal = {
+                        "asset": asset,
+                        "strategy": "16 Delta Short Strangle",
+                        "sell_call": {"strike": call_strike, "iv": call_iv, "symbol": f"{asset}_CALL_16D", "quantity": qty_call},
+                        "sell_put": {"strike": put_strike, "iv": put_iv, "symbol": f"{asset}_PUT_16D", "quantity": qty_put},
+                        "expiration": exp,
+                        "premium": total_premium,
+                        "leg_premiums": leg_premiums,
+                        "rationale": (
+                            "16 Delta Short Strangle: Venda de call e put com delta ~16, vencimento de 45 dias "
+                            "(ou diversificação 5 dias antes/depois), rolagem 21 dias antes, "
+                            "margem conforme VI e ROI de 65% para realização de lucros."
+                        ),
+                    }
             signals_list.append((signal, roll_instruction))
         return signals_list
 
@@ -594,10 +848,12 @@ class OptionStrategyBot:
             short_strangle_signals = self.analyze_and_generate_short_strangle(asset)
             bull_call_signals = self.analyze_and_generate_bull_call_spread(asset)
             bear_put_signals = self.analyze_and_generate_bear_put_spread(asset)
+            delta16_signals = self.analyze_and_generate_16delta_short_strangle(asset)
             signals[asset] = {
                 "short_strangle": short_strangle_signals,
                 "bull_call_spread": bull_call_signals,
                 "bear_put_spread": bear_put_signals,
+                "16_delta_short_strangle": delta16_signals,
             }
             time.sleep(1)  # Pequeno delay para evitar rate limits
         return signals
@@ -622,7 +878,8 @@ if __name__ == "__main__":
                     for signal, roll_instruction in signals_list:
                         # Se o sinal for de "No Trade" ou "Erro", exibe os detalhes (não são gravados)
                         if ("No Trade" in signal["strategy"]) or ("Erro" in signal["strategy"]):
-                            print(f"\nEstratégia: {strat_name}")
+                            print("-" * 80)
+                            print(f"\nEstratégia: {strat_name} - {signal.get('asset', asset)}")
                             for key, value in signal.items():
                                 print(f"{key}: {value}")
                         else:
@@ -636,16 +893,15 @@ if __name__ == "__main__":
                                 roll_instruction,
                             )
                             if signal_id is None:
-                                # Se já existir, exibe somente a mensagem reduzida
                                 print(f"\nSinal para {asset} - {signal['strategy']} com expiração {signal.get('expiration', '')} já existe.")
                             else:
-                                # Se inserido, exibe os logs detalhados
                                 print("-" * 80)
-                                print(f"\nEstratégia: {strat_name}")
+                                print(f"\nEstratégia: {strat_name} - {signal.get('asset', asset)}")
                                 for key, value in signal.items():
                                     print(f"{key}: {value}")
-                                # Insere os legs do sinal no banco
-                                db.insert_signal_legs(signal_id, signal, bot.asset_min_qty.get(asset, 0.01))
+                                db.insert_signal_legs(
+                                    signal_id, signal, bot.asset_min_qty.get(asset, 0.01)
+                                )
         except Exception as e:
             print(f"Erro na execução do robô: {e}")
 

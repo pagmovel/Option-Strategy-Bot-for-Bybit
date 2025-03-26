@@ -1,0 +1,92 @@
+
+rationale: Crédito líquido: 1.6415.
+--------------------------------------------------------------------------------
+Estratégia: bear_put_spread - SOL
+asset: SOL
+strategy: Bear Put Spread
+sell_put: {'strike': 124.317, 'iv': 0.65, 'symbol': 'SOL_PUT_OTM1', 'quantity': 1.5}
+buy_put: {'strike': 117.4105, 'iv': 0.7, 'symbol': 'SOL_PUT_OTM2', 'quantity': 1.5}
+expiration: 2025-08-13
+premium: 1.6377784159151076
+leg_premiums: {'sold_put': 14.45463839199995, 'bought_put': 12.816859976084842}
+rationale: Crédito líquido: 1.6378.
+--------------------------------------------------------------------------------
+Estratégia: bear_put_spread - SOL
+asset: SOL
+strategy: Bear Put Spread
+sell_put: {'strike': 124.317, 'iv': 0.65, 'symbol': 'SOL_PUT_OTM1', 'quantity': 1.5}
+buy_put: {'strike': 117.4105, 'iv': 0.7, 'symbol': 'SOL_PUT_OTM2', 'quantity': 1.5}
+expiration: 2025-08-20
+premium: 1.6333010940489245
+leg_premiums: {'sold_put': 14.934644902779063, 'bought_put': 13.301343808730138}
+rationale: Crédito líquido: 1.6333.
+--------------------------------------------------------------------------------
+Estratégia: bear_put_spread - SOL
+asset: SOL
+strategy: Bear Put Spread
+sell_put: {'strike': 124.317, 'iv': 0.65, 'symbol': 'SOL_PUT_OTM1', 'quantity': 1.5}
+buy_put: {'strike': 117.4105, 'iv': 0.7, 'symbol': 'SOL_PUT_OTM2', 'quantity': 1.5}
+expiration: 2025-08-27
+premium: 1.6281941238810163
+leg_premiums: {'sold_put': 15.403152908290053, 'bought_put': 13.774958784409037}
+rationale: Crédito líquido: 1.6282.
+--------------------------------------------------------------------------------
+Estratégia: bear_put_spread - SOL
+asset: SOL
+strategy: Bear Put Spread
+sell_put: {'strike': 124.317, 'iv': 0.65, 'symbol': 'SOL_PUT_OTM1', 'quantity': 1.5}
+buy_put: {'strike': 117.4105, 'iv': 0.7, 'symbol': 'SOL_PUT_OTM2', 'quantity': 1.5}
+expiration: 2025-09-03
+premium: 1.6225528466028152
+leg_premiums: {'sold_put': 15.860878995795858, 'bought_put': 14.238326149193043}
+rationale: Crédito líquido: 1.6226.
+--------------------------------------------------------------------------------
+Estratégia: bear_put_spread - SOL
+asset: SOL
+strategy: Bear Put Spread
+sell_put: {'strike': 124.317, 'iv': 0.65, 'symbol': 'SOL_PUT_OTM1', 'quantity': 1.5}
+buy_put: {'strike': 117.4105, 'iv': 0.7, 'symbol': 'SOL_PUT_OTM2', 'quantity': 1.5}
+expiration: 2025-09-10
+premium: 1.6164573439748011
+leg_premiums: {'sold_put': 16.308467608987293, 'bought_put': 14.692010265012492}
+rationale: Crédito líquido: 1.6165.
+--------------------------------------------------------------------------------
+Estratégia: bear_put_spread - SOL
+asset: SOL
+strategy: Bear Put Spread
+sell_put: {'strike': 124.317, 'iv': 0.65, 'symbol': 'SOL_PUT_OTM1', 'quantity': 1.5}
+buy_put: {'strike': 117.4105, 'iv': 0.7, 'symbol': 'SOL_PUT_OTM2', 'quantity': 1.5}
+expiration: 2025-09-17
+premium: 1.6099752942614032
+leg_premiums: {'sold_put': 16.746500816328897, 'bought_put': 15.136525522067494}
+rationale: Crédito líquido: 1.6100.
+--------------------------------------------------------------------------------
+Estratégia: 16_delta_short_strangle - SOL
+asset: SOL
+strategy: 16 Delta Short Strangle
+sell_call: {'strike': 158.84949999999998, 'iv': 0.5, 'symbol': 'SOL_CALL_16D', 'quantity': 1.0}
+sell_put: {'strike': 117.4105, 'iv': 0.5, 'symbol': 'SOL_PUT_16D', 'quantity': 1.0}
+expiration: 2025-05-10
+premium: 5.181198568652885
+leg_premiums: {'sell_call': 3.1180201376627146, 'sell_put': 2.0631784309901704}
+rationale: 16 Delta Short Strangle: Venda de call e put com delta ~16, vencimento de 45 dias (ou diversificação 5 dias antes/depois), rolagem 21 dias antes, margem conforme VI e ROI de 65% para realização de lucros.
+--------------------------------------------------------------------------------
+Estratégia: 16_delta_short_strangle - SOL
+asset: SOL
+strategy: 16 Delta Short Strangle
+sell_call: {'strike': 158.84949999999998, 'iv': 0.5, 'symbol': 'SOL_CALL_16D', 'quantity': 1.0}
+sell_put: {'strike': 117.4105, 'iv': 0.5, 'symbol': 'SOL_PUT_16D', 'quantity': 1.0}
+expiration: 2025-05-05
+premium: 4.433875024795981
+leg_premiums: {'sell_call': 2.688301567829562, 'sell_put': 1.7455734569664187}
+rationale: 16 Delta Short Strangle: Venda de call e put com delta ~16, vencimento de 45 dias (ou diversificação 5 dias antes/depois), rolagem 21 dias antes, margem conforme VI e ROI de 65% para realização de lucros.
+--------------------------------------------------------------------------------
+Estratégia: 16_delta_short_strangle - SOL
+asset: SOL
+strategy: 16 Delta Short Strangle
+sell_call: {'strike': 158.84949999999998, 'iv': 0.5, 'symbol': 'SOL_CALL_16D', 'quantity': 1.0}
+sell_put: {'strike': 117.4105, 'iv': 0.5, 'symbol': 'SOL_PUT_16D', 'quantity': 1.0}
+expiration: 2025-05-15
+premium: 5.9174430856323
+leg_premiums: {'sell_call': 3.5393450436622587, 'sell_put': 2.3780980419700413}
+rationale: 16 Delta Short Strangle: Venda de call e put com delta ~16, vencimento de 45 dias (ou diversificação 5 dias antes/depois), rolagem 21 dias antes, margem conforme VI e ROI de 65% para realização de lucros.
