@@ -2,6 +2,7 @@ import ccxt
 import time
 import sqlite3
 import json
+import pytz
 from datetime import datetime, timedelta
 from math import log, sqrt, exp, erf
 
@@ -40,12 +41,12 @@ def black_scholes_price(S, K, T, r, sigma, option_type):
     d1 = (log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T))
     d2 = d1 - sigma * sqrt(T)
     if option_type == "call":
-        price = S * norm_cdf(d1) - K * exp(-r * T) * norm_cdf(d2)
+        return S * norm_cdf(d1) - K * exp(-r * T) * norm_cdf(d2)
     elif option_type == "put":
-        price = K * exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
+        return K * exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
     else:
-        price = None
-    return price
+        return None
+    
 
 
 class SignalDatabase:
@@ -127,9 +128,7 @@ class SignalDatabase:
         row = cursor.fetchone()
         return row is not None
 
-    def insert_signal(
-        self, asset, strategy, expiration, premium, signal_details, roll_instruction
-    ):
+    def insert_signal(self, asset, strategy, expiration, premium, signal_details, roll_instruction):
         """
         Insere um novo sinal na tabela 'signals', se não for duplicado.
         Retorna o ID do sinal inserido ou None se já existir.
@@ -150,14 +149,7 @@ class SignalDatabase:
             INSERT INTO signals (asset, strategy, expiration, premium, signal_details, roll_instruction)
             VALUES (?, ?, ?, ?, ?, ?)
         """,
-            (
-                asset,
-                strategy,
-                expiration,
-                premium,
-                json.dumps(signal_details),
-                roll_instruction,
-            ),
+            (asset, strategy, expiration, premium, json.dumps(signal_details), roll_instruction),
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -197,53 +189,29 @@ class SignalDatabase:
                 self.insert_signal_leg(signal_id, leg_key, premium_value, quantity)
 
     def check_roll_signals(self, roll_threshold_days=2, profit_threshold=0.75):
-        """
-        Verifica os sinais ativos para identificar se algum sinal deve ser rolado.
-
-        Critérios:
-          - Se a expiração estiver a <= roll_threshold_days da data atual;
-          - Ou se a fração do tempo decorrido desde a criação do sinal for >= profit_threshold
-            (simulação de que o lucro máximo já foi atingido).
-
-        Após a verificação, os sinais notificados têm seu status atualizado para 'rolled'.
-
-        :param roll_threshold_days: Número de dias para considerar próximo da expiração.
-        :param profit_threshold: Fração de tempo decorrido que indica lucro máximo.
-        :return: Lista de notificações sobre os sinais a serem rolados.
-        """
+        tz = pytz.timezone("America/Recife")
+        now = datetime.now(tz)
         cursor = self.conn.cursor()
         cursor.execute(
             "SELECT id, asset, strategy, expiration, premium, roll_instruction, timestamp FROM signals WHERE status = 'active'"
         )
         rows = cursor.fetchall()
         notifications = []
-        now = datetime.now()
         for row in rows:
-            (
-                signal_id,
-                asset,
-                strategy,
-                expiration,
-                premium,
-                roll_instruction,
-                entry_timestamp,
-            ) = row
+            (signal_id, asset, strategy, expiration, premium, roll_instruction, entry_timestamp) = row
             try:
-                exp_date = datetime.strptime(expiration, "%Y-%m-%d")
-                entry_date = datetime.strptime(entry_timestamp, "%Y-%m-%d %H:%M:%S")
+                exp_date_naive = datetime.strptime(expiration, "%Y-%m-%d")
+                exp_date = tz.localize(exp_date_naive)
+                entry_date_naive = datetime.strptime(entry_timestamp, "%Y-%m-%d %H:%M:%S")
+                entry_date = tz.localize(entry_date_naive)
             except Exception as e:
                 continue
 
             time_to_exp = exp_date - now
             notify_exp = time_to_exp <= timedelta(days=roll_threshold_days)
-
             total_time = exp_date - entry_date
             elapsed = now - entry_date
-            profit_fraction = (
-                elapsed.total_seconds() / total_time.total_seconds()
-                if total_time.total_seconds() > 0
-                else 0
-            )
+            profit_fraction = (elapsed.total_seconds() / total_time.total_seconds() if total_time.total_seconds() > 0 else 0)
             notify_profit = profit_fraction >= profit_threshold
 
             if notify_exp or notify_profit:
@@ -264,9 +232,7 @@ class SignalDatabase:
                         f"(indicativo de lucro máximo). Instrução de Rolagem: {roll_instruction}"
                     )
                 notifications.append(message)
-                cursor.execute(
-                    "UPDATE signals SET status = 'rolled' WHERE id = ?", (signal_id,)
-                )
+                cursor.execute("UPDATE signals SET status = 'rolled' WHERE id = ?", (signal_id,))
         self.conn.commit()
         return notifications
 
@@ -282,7 +248,7 @@ class OptionStrategyBot:
 
     Cada sinal inclui:
       - Preço calculado utilizando Black–Scholes (com base em S, K, T, r e IV).
-      - Quantidade padrão de operação (0.01 por perna), com possibilidade de ajuste.
+      - Quantidade padrão de operação, definida conforme o ativo.
       - Armazenamento dos prêmios de cada perna em 'leg_premiums'.
       - Instruções de rolagem para a próxima expiração.
     """
@@ -299,12 +265,7 @@ class OptionStrategyBot:
         self.quote_currency = quote_currency
         self.r = r
         if api_key and secret:
-            self.exchange = ccxt.bybit(
-                {
-                    "apiKey": api_key,
-                    "secret": secret,
-                }
-            )
+            self.exchange = ccxt.bybit({"apiKey": api_key, "secret": secret})
         else:
             self.exchange = ccxt.bybit()  # Usa apenas endpoints públicos
         self.assets = ["BTC", "ETH", "SOL"]
@@ -331,17 +292,28 @@ class OptionStrategyBot:
         Simula a obtenção de dados de opções para o ativo.
         (Essa função deve ser ajustada para usar dados reais, se disponíveis.)
 
+        Gera automaticamente vencimentos semanais até 180 dias a partir de hoje.
+
         :param asset: Nome do ativo (ex: 'BTC').
         :return: Dicionário contendo:
-                  - 'expirations': lista de datas de vencimento (ex: ['2025-03-30', '2025-04-06'])
+                  - 'expirations': lista de datas de vencimento no formato 'YYYY-MM-DD'.
                   - 'calls': lista de calls com strike, IV e símbolo.
                   - 'puts': lista de puts com strike, IV e símbolo.
         """
         underlying_price = self.fetch_underlying_price(asset)
         if underlying_price is None:
             underlying_price = 0
-        simulated_data = {
-            "expirations": ["2025-03-30", "2025-04-06"],
+        tz = pytz.timezone("America/Recife")
+        now = datetime.now(tz)
+        expirations = []
+        start = now + timedelta(days=7)
+        end = now + timedelta(days=180)
+        current = start
+        while current <= end:
+            expirations.append(current.strftime("%Y-%m-%d"))
+            current += timedelta(days=7)
+        return {
+            "expirations": expirations,
             "calls": [
                 {
                     "strike": 1.10 * underlying_price,
@@ -367,7 +339,6 @@ class OptionStrategyBot:
                 },
             ],
         }
-        return simulated_data
 
     def time_to_expiration(self, expiration):
         """
@@ -377,8 +348,10 @@ class OptionStrategyBot:
         :return: Tempo até expiração (T) em anos.
         """
         try:
-            exp_date = datetime.strptime(expiration, "%Y-%m-%d")
-            now = datetime.now()
+            tz = pytz.timezone("America/Recife")
+            exp_date_naive = datetime.strptime(expiration, "%Y-%m-%d")
+            exp_date = tz.localize(exp_date_naive)
+            now = datetime.now(tz)
             T_seconds = (exp_date - now).total_seconds()
             T_years = T_seconds / (365 * 24 * 3600)
             return max(T_years, 0)  # Garante que T não seja negativo
@@ -388,283 +361,243 @@ class OptionStrategyBot:
 
     def analyze_and_generate_short_strangle(self, asset):
         """
-        Analisa o ativo para gerar um sinal de Short Strangle.
-
-        A estratégia é executada se existirem opções OTM (call e put) e a IV média for maior que o limiar.
-        Utiliza o modelo Black–Scholes para precificar cada perna.
+        Analisa o ativo para gerar sinais de Short Strangle para todos os vencimentos
+        disponíveis até 6 meses.
 
         :param asset: Nome do ativo (ex: 'BTC').
-        :return: Tuple contendo:
-                 - Dicionário com os detalhes do sinal.
-                 - String com a instrução de rolagem.
+        :return: Lista de tuplas (sinal, roll_instruction) para cada vencimento válido.
         """
         price = self.fetch_underlying_price(asset)
         if price is None:
-            return {
-                "strategy": "Erro",
-                "rationale": f"Não foi possível obter o preço de {asset}",
-            }, ""
-        print(
-            f"\nAnalisando Short Strangle para {asset}: preço atual = {price:.2f} {self.quote_currency}"
-        )
+            return []
         options_data = self.fetch_options_data(asset)
-        expiration = options_data.get("expirations", [None])[0]
-        T = self.time_to_expiration(expiration)
-        otm_calls = [op for op in options_data["calls"] if op["strike"] > price]
-        otm_puts = [op for op in options_data["puts"] if op["strike"] < price]
-
-        # Define a quantidade padrão com base no ativo
-        default_qty = self.asset_min_qty.get(asset, 0.01)
-
-        if otm_calls and otm_puts:
-            call_to_sell = min(otm_calls, key=lambda x: x["strike"])
-            put_to_sell = max(otm_puts, key=lambda x: x["strike"])
-            # Precifica cada perna utilizando Black–Scholes
-            premium_call = black_scholes_price(
-                price, call_to_sell["strike"], T, self.r, call_to_sell["iv"], "call"
-            )
-            premium_put = black_scholes_price(
-                price, put_to_sell["strike"], T, self.r, put_to_sell["iv"], "put"
-            )
-            total_premium = premium_call + premium_put
-            leg_premiums = {"sell_call": premium_call, "sell_put": premium_put}
-
-            # Ajusta a quantidade se um prêmio for 10% maior que o outro
-            sell_call_qty = default_qty
-            sell_put_qty = default_qty
-            if premium_call > premium_put * 1.1:
-                sell_call_qty = default_qty * 1.5
-            elif premium_put > premium_call * 1.1:
-                sell_put_qty = default_qty * 1.5
-
-            if (call_to_sell["iv"] + put_to_sell["iv"]) / 2.0 > self.iv_threshold:
-                roll_instruction = "Fechar posições e montar novo Short Strangle para a próxima expiração."
-                call_to_sell.update({"quantity": sell_call_qty})
-                put_to_sell.update({"quantity": sell_put_qty})
-                signal = {
-                    "strategy": "Short Strangle",
-                    "sell_call": call_to_sell,
-                    "sell_put": put_to_sell,
-                    "expiration": expiration,
-                    "premium": total_premium,
-                    "leg_premiums": leg_premiums,
-                    "rationale": (
-                        f"IV média acima do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}."
-                    ),
-                }
+        tz = pytz.timezone("America/Recife")
+        now = datetime.now(tz)
+        valid_exps = [exp for exp in options_data.get("expirations", [])
+                      if 0 <= (tz.localize(datetime.strptime(exp, "%Y-%m-%d")) - now).days <= 180]
+        signals_list = []
+        for expiration in valid_exps:
+            T = self.time_to_expiration(expiration)
+            otm_calls = [op for op in options_data["calls"] if op["strike"] > price]
+            otm_puts = [op for op in options_data["puts"] if op["strike"] < price]
+            default_qty = self.asset_min_qty.get(asset, 0.01)
+            if otm_calls and otm_puts:
+                call_to_sell = min(otm_calls, key=lambda x: x["strike"])
+                put_to_sell = max(otm_puts, key=lambda x: x["strike"])
+                premium_call = black_scholes_price(price, call_to_sell["strike"], T, self.r, call_to_sell["iv"], "call")
+                premium_put = black_scholes_price(price, put_to_sell["strike"], T, self.r, put_to_sell["iv"], "put")
+                total_premium = premium_call + premium_put
+                leg_premiums = {"sell_call": premium_call, "sell_put": premium_put}
+                sell_call_qty = default_qty
+                sell_put_qty = default_qty
+                if premium_call > premium_put * 1.1:
+                    sell_call_qty = default_qty * 1.5
+                elif premium_put > premium_call * 1.1:
+                    sell_put_qty = default_qty * 1.5
+                if (call_to_sell["iv"] + put_to_sell["iv"]) / 2.0 > self.iv_threshold:
+                    roll_instruction = "Fechar posições e montar novo Short Strangle para a próxima expiração."
+                    call_to_sell.update({"quantity": sell_call_qty})
+                    put_to_sell.update({"quantity": sell_put_qty})
+                    signal = {
+                        "strategy": "Short Strangle",
+                        "sell_call": call_to_sell,
+                        "sell_put": put_to_sell,
+                        "expiration": expiration,
+                        "premium": total_premium,
+                        "leg_premiums": leg_premiums,
+                        "rationale": f"IV média acima do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}.",
+                    }
+                else:
+                    roll_instruction = ""
+                    signal = {
+                        "strategy": "No Trade - Short Strangle",
+                        "expiration": expiration,
+                        "premium": total_premium,
+                        "leg_premiums": leg_premiums,
+                        "rationale": f"IV média abaixo do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}.",
+                    }
             else:
                 roll_instruction = ""
                 signal = {
                     "strategy": "No Trade - Short Strangle",
                     "expiration": expiration,
-                    "premium": total_premium,
-                    "leg_premiums": leg_premiums,
-                    "rationale": (
-                        f"IV média abaixo do limiar. Preços: call={premium_call:.4f}, put={premium_put:.4f}."
-                    ),
+                    "premium": 0,
+                    "leg_premiums": {},
+                    "rationale": "Opções OTM não disponíveis.",
                 }
-        else:
-            roll_instruction = ""
-            signal = {
-                "strategy": "No Trade - Short Strangle",
-                "expiration": expiration,
-                "premium": 0,
-                "leg_premiums": {},
-                "rationale": "Opções OTM não disponíveis.",
-            }
-        return signal, roll_instruction
+            signals_list.append((signal, roll_instruction))
+        return signals_list
 
     def analyze_and_generate_bull_call_spread(self, asset):
         """
-        Analisa o ativo para gerar um sinal de Bull Call Spread.
-
-        A estratégia consiste em vender a call OTM e comprar a próxima call (com strike maior) para proteção.
-        Utiliza Black–Scholes para precificar as opções.
+        Analisa o ativo para gerar sinais de Bull Call Spread para todos os vencimentos
+        disponíveis até 6 meses.
 
         :param asset: Nome do ativo (ex: 'BTC').
-        :return: Tuple contendo o sinal (dicionário) e a instrução de rolagem.
+        :return: Lista de tuplas (sinal, roll_instruction) para cada vencimento válido.
         """
         price = self.fetch_underlying_price(asset)
         if price is None:
-            return {
-                "strategy": "Erro",
-                "rationale": f"Não foi possível obter o preço de {asset}",
-            }, ""
-        print(
-            f"\nAnalisando Bull Call Spread para {asset}: preço atual = {price:.2f} {self.quote_currency}"
-        )
+            return []
         options_data = self.fetch_options_data(asset)
-        expiration = options_data.get("expirations", [None])[0]
-        T = self.time_to_expiration(expiration)
-        calls = options_data["calls"]
+        tz = pytz.timezone("America/Recife")
+        now = datetime.now(tz)
+        valid_exps = [exp for exp in options_data.get("expirations", [])
+                      if 0 <= (tz.localize(datetime.strptime(exp, "%Y-%m-%d")) - now).days <= 180]
+        signals_list = []
+        for expiration in valid_exps:
+            T = self.time_to_expiration(expiration)
+            calls = options_data["calls"]
+            if len(calls) >= 2:
+                sorted_calls = sorted(calls, key=lambda x: x["strike"])
+                sold_call = next((op for op in sorted_calls if op["strike"] > price), None)
+                if sold_call is None:
+                    signal = {
+                        "strategy": "No Trade - Bull Call Spread",
+                        "rationale": "Nenhuma call OTM disponível.",
+                        "expiration": expiration,
+                        "premium": 0,
+                    }
+                    signals_list.append((signal, ""))
+                    continue
+                index = sorted_calls.index(sold_call)
+                if index + 1 < len(sorted_calls):
+                    bought_call = sorted_calls[index + 1]
+                else:
+                    signal = {
+                        "strategy": "No Trade - Bull Call Spread",
+                        "rationale": "Não há call para proteção.",
+                        "expiration": expiration,
+                        "premium": 0,
+                    }
+                    signals_list.append((signal, ""))
+                    continue
 
-        if len(calls) >= 2:
-            sorted_calls = sorted(calls, key=lambda x: x["strike"])
-            sold_call = next((op for op in sorted_calls if op["strike"] > price), None)
-            if sold_call is None:
-                return {
-                    "strategy": "No Trade - Bull Call Spread",
-                    "rationale": "Nenhuma call OTM disponível.",
+                sold_call_premium = black_scholes_price(price, sold_call["strike"], T, self.r, sold_call["iv"], "call")
+                bought_call_cost = black_scholes_price(price, bought_call["strike"], T, self.r, bought_call["iv"], "call")
+                net_credit = sold_call_premium - bought_call_cost
+                leg_premiums = {"sold_call": sold_call_premium, "bought_call": bought_call_cost}
+                qty = self.asset_min_qty.get(asset, 0.01)
+                if net_credit > price * 0.001:
+                    qty = self.asset_min_qty.get(asset, 0.01) * 1.5
+                sold_call.update({"quantity": qty})
+                bought_call.update({"quantity": qty})
+                roll_instruction = "Fechar a trava de alta e montar nova trava para a próxima expiração."
+                signal = {
+                    "strategy": "Bull Call Spread",
+                    "sell_call": sold_call,
+                    "buy_call": bought_call,
                     "expiration": expiration,
-                    "premium": 0,
-                }, ""
-            index = sorted_calls.index(sold_call)
-            if index + 1 < len(sorted_calls):
-                bought_call = sorted_calls[index + 1]
+                    "premium": net_credit,
+                    "leg_premiums": leg_premiums,
+                    "rationale": f"Crédito líquido: {net_credit:.4f}.",
+                }
             else:
-                return {
+                roll_instruction = ""
+                signal = {
                     "strategy": "No Trade - Bull Call Spread",
-                    "rationale": "Não há call para proteção.",
                     "expiration": expiration,
                     "premium": 0,
-                }, ""
-
-            sold_call_premium = black_scholes_price(
-                price, sold_call["strike"], T, self.r, sold_call["iv"], "call"
-            )
-            bought_call_cost = black_scholes_price(
-                price, bought_call["strike"], T, self.r, bought_call["iv"], "call"
-            )
-            net_credit = sold_call_premium - bought_call_cost
-            leg_premiums = {
-                "sold_call": sold_call_premium,
-                "bought_call": bought_call_cost,
-            }
-
-            qty = self.asset_min_qty.get(asset, 0.01)
-            if net_credit > price * 0.001:
-                qty = self.asset_min_qty.get(asset, 0.01) * 1.5
-
-            sold_call.update({"quantity": qty})
-            bought_call.update({"quantity": qty})
-            roll_instruction = (
-                "Fechar a trava de alta e montar nova trava para a próxima expiração."
-            )
-            signal = {
-                "strategy": "Bull Call Spread",
-                "sell_call": sold_call,
-                "buy_call": bought_call,
-                "expiration": expiration,
-                "premium": net_credit,
-                "leg_premiums": leg_premiums,
-                "rationale": f"Crédito líquido: {net_credit:.4f}.",
-            }
-        else:
-            roll_instruction = ""
-            signal = {
-                "strategy": "No Trade - Bull Call Spread",
-                "expiration": expiration,
-                "premium": 0,
-                "leg_premiums": {},
-                "rationale": "Dados insuficientes de opções.",
-            }
-        return signal, roll_instruction
+                    "leg_premiums": {},
+                    "rationale": "Dados insuficientes de opções.",
+                }
+            signals_list.append((signal, roll_instruction))
+        return signals_list
 
     def analyze_and_generate_bear_put_spread(self, asset):
         """
-        Analisa o ativo para gerar um sinal de Bear Put Spread.
-
-        A estratégia consiste em vender a put OTM e comprar a próxima put (com strike menor) para proteção.
-        Utiliza Black–Scholes para precificar as opções.
+        Analisa o ativo para gerar sinais de Bear Put Spread para todos os vencimentos
+        disponíveis até 6 meses.
 
         :param asset: Nome do ativo (ex: 'BTC').
-        :return: Tuple contendo o sinal (dicionário) e a instrução de rolagem.
+        :return: Lista de tuplas (sinal, roll_instruction) para cada vencimento válido.
         """
         price = self.fetch_underlying_price(asset)
         if price is None:
-            return {
-                "strategy": "Erro",
-                "rationale": f"Não foi possível obter o preço de {asset}",
-            }, ""
-        print(
-            f"\nAnalisando Bear Put Spread para {asset}: preço atual = {price:.2f} {self.quote_currency}"
-        )
+            return []
         options_data = self.fetch_options_data(asset)
-        expiration = options_data.get("expirations", [None])[0]
-        T = self.time_to_expiration(expiration)
-        puts = options_data["puts"]
+        tz = pytz.timezone("America/Recife")
+        now = datetime.now(tz)
+        valid_exps = [exp for exp in options_data.get("expirations", [])
+                      if 0 <= (tz.localize(datetime.strptime(exp, "%Y-%m-%d")) - now).days <= 180]
+        signals_list = []
+        for expiration in valid_exps:
+            T = self.time_to_expiration(expiration)
+            puts = options_data["puts"]
+            if len(puts) >= 2:
+                sorted_puts = sorted(puts, key=lambda x: x["strike"], reverse=True)
+                sold_put = next((op for op in sorted_puts if op["strike"] < price), None)
+                if sold_put is None:
+                    signal = {
+                        "strategy": "No Trade - Bear Put Spread",
+                        "rationale": "Nenhuma put OTM disponível.",
+                        "expiration": expiration,
+                        "premium": 0,
+                    }
+                    signals_list.append((signal, ""))
+                    continue
+                index = sorted_puts.index(sold_put)
+                if index + 1 < len(sorted_puts):
+                    bought_put = sorted_puts[index + 1]
+                else:
+                    signal = {
+                        "strategy": "No Trade - Bear Put Spread",
+                        "rationale": "Não há put para proteção.",
+                        "expiration": expiration,
+                        "premium": 0,
+                    }
+                    signals_list.append((signal, ""))
+                    continue
 
-        if len(puts) >= 2:
-            sorted_puts = sorted(puts, key=lambda x: x["strike"], reverse=True)
-            sold_put = next((op for op in sorted_puts if op["strike"] < price), None)
-            if sold_put is None:
-                return {
-                    "strategy": "No Trade - Bear Put Spread",
-                    "rationale": "Nenhuma put OTM disponível.",
+                sold_put_premium = black_scholes_price(price, sold_put["strike"], T, self.r, sold_put["iv"], "put")
+                bought_put_cost = black_scholes_price(price, bought_put["strike"], T, self.r, bought_put["iv"], "put")
+                net_credit = sold_put_premium - bought_put_cost
+                leg_premiums = {"sold_put": sold_put_premium, "bought_put": bought_put_cost}
+                qty = self.asset_min_qty.get(asset, 0.01)
+                if net_credit > price * 0.001:
+                    qty = self.asset_min_qty.get(asset, 0.01) * 1.5
+                sold_put.update({"quantity": qty})
+                bought_put.update({"quantity": qty})
+                roll_instruction = "Fechar a trava de baixa e montar nova trava para a próxima expiração."
+                signal = {
+                    "strategy": "Bear Put Spread",
+                    "sell_put": sold_put,
+                    "buy_put": bought_put,
                     "expiration": expiration,
-                    "premium": 0,
-                }, ""
-            index = sorted_puts.index(sold_put)
-            if index + 1 < len(sorted_puts):
-                bought_put = sorted_puts[index + 1]
+                    "premium": net_credit,
+                    "leg_premiums": leg_premiums,
+                    "rationale": f"Crédito líquido: {net_credit:.4f}.",
+                }
             else:
-                return {
+                roll_instruction = ""
+                signal = {
                     "strategy": "No Trade - Bear Put Spread",
-                    "rationale": "Não há put para proteção.",
                     "expiration": expiration,
                     "premium": 0,
-                }, ""
-
-            sold_put_premium = black_scholes_price(
-                price, sold_put["strike"], T, self.r, sold_put["iv"], "put"
-            )
-            bought_put_cost = black_scholes_price(
-                price, bought_put["strike"], T, self.r, bought_put["iv"], "put"
-            )
-            net_credit = sold_put_premium - bought_put_cost
-            leg_premiums = {"sold_put": sold_put_premium, "bought_put": bought_put_cost}
-
-            qty = self.asset_min_qty.get(asset, 0.01)
-            if net_credit > price * 0.001:
-                qty = self.asset_min_qty.get(asset, 0.01) * 1.5
-
-            sold_put.update({"quantity": qty})
-            bought_put.update({"quantity": qty})
-            roll_instruction = (
-                "Fechar a trava de baixa e montar nova trava para a próxima expiração."
-            )
-            signal = {
-                "strategy": "Bear Put Spread",
-                "sell_put": sold_put,
-                "buy_put": bought_put,
-                "expiration": expiration,
-                "premium": net_credit,
-                "leg_premiums": leg_premiums,
-                "rationale": f"Crédito líquido: {net_credit:.4f}.",
-            }
-        else:
-            roll_instruction = ""
-            signal = {
-                "strategy": "No Trade - Bear Put Spread",
-                "expiration": expiration,
-                "premium": 0,
-                "leg_premiums": {},
-                "rationale": "Dados insuficientes de opções.",
-            }
-        return signal, roll_instruction
+                    "leg_premiums": {},
+                    "rationale": "Dados insuficientes de opções.",
+                }
+            signals_list.append((signal, roll_instruction))
+        return signals_list
 
     def run(self):
         """
         Executa a análise para cada ativo configurado e gera os sinais para cada estratégia.
+        Para cada ativo, gera uma lista de sinais para cada estratégia (baseados em cada vencimento válido).
 
-        :return: Dicionário com os sinais gerados, onde cada chave é um ativo.
+        :return: Dicionário com os sinais gerados, onde cada chave é um ativo e o valor é um dicionário
+                 com cada estratégia contendo uma lista de tuplas (sinal, roll_instruction).
         """
         signals = {}
         for asset in self.assets:
             print(f"\n=== Análise do ativo: {asset}/{self.quote_currency} ===")
-            short_strangle, roll_instruction_strangle = (
-                self.analyze_and_generate_short_strangle(asset)
-            )
-            bull_call, roll_instruction_bull = (
-                self.analyze_and_generate_bull_call_spread(asset)
-            )
-            bear_put, roll_instruction_bear = self.analyze_and_generate_bear_put_spread(
-                asset
-            )
+            short_strangle_signals = self.analyze_and_generate_short_strangle(asset)
+            bull_call_signals = self.analyze_and_generate_bull_call_spread(asset)
+            bear_put_signals = self.analyze_and_generate_bear_put_spread(asset)
             signals[asset] = {
-                "short_strangle": (short_strangle, roll_instruction_strangle),
-                "bull_call_spread": (bull_call, roll_instruction_bull),
-                "bear_put_spread": (bear_put, roll_instruction_bear),
+                "short_strangle": short_strangle_signals,
+                "bull_call_spread": bull_call_signals,
+                "bear_put_spread": bear_put_signals,
             }
             time.sleep(1)  # Pequeno delay para evitar rate limits
         return signals
@@ -684,47 +617,39 @@ if __name__ == "__main__":
             results = bot.run()
             print("\n=== Sinais de Entrada Gerados ===")
             for asset, strategies in results.items():
-                # Para cada estratégia do ativo:
-                for strat_name, (signal, roll_instruction) in strategies.items():
-                    # Se o sinal for de "No Trade" ou "Erro", exibe os detalhes (não são gravados)
-                    if ("No Trade" in signal["strategy"]) or (
-                        "Erro" in signal["strategy"]
-                    ):
-                        print(f"\nEstratégia: {strat_name}")
-                        for key, value in signal.items():
-                            print(f"{key}: {value}")
-                    else:
-                        # Para sinais válidos, tenta inseri-los no banco
-                        signal_id = db.insert_signal(
-                            asset,
-                            signal["strategy"],
-                            signal.get("expiration", ""),
-                            signal.get("premium", 0),
-                            signal,
-                            roll_instruction,
-                        )
-                        if signal_id is None:
-                            # Se já existir, exibe somente a mensagem reduzida
-                            print(
-                                f"\nSinal para {asset} - {signal['strategy']} com expiração {signal.get('expiration', '')} já existe."
-                            )
-                        else:
-                            # Se inserido, exibe os logs detalhados
+                # Para cada estratégia do ativo, iteramos sobre cada sinal gerado (para cada vencimento)
+                for strat_name, signals_list in strategies.items():
+                    for signal, roll_instruction in signals_list:
+                        # Se o sinal for de "No Trade" ou "Erro", exibe os detalhes (não são gravados)
+                        if ("No Trade" in signal["strategy"]) or ("Erro" in signal["strategy"]):
                             print(f"\nEstratégia: {strat_name}")
                             for key, value in signal.items():
                                 print(f"{key}: {value}")
-                            # Insere os legs do sinal no banco
-                            db.insert_signal_legs(
-                                signal_id, signal, bot.asset_min_qty.get(asset, 0.01)
+                        else:
+                            # Para sinais válidos, tenta inseri-los no banco
+                            signal_id = db.insert_signal(
+                                asset,
+                                signal["strategy"],
+                                signal.get("expiration", ""),
+                                signal.get("premium", 0),
+                                signal,
+                                roll_instruction,
                             )
+                            if signal_id is None:
+                                # Se já existir, exibe somente a mensagem reduzida
+                                print(f"\nSinal para {asset} - {signal['strategy']} com expiração {signal.get('expiration', '')} já existe.")
+                            else:
+                                # Se inserido, exibe os logs detalhados
+                                print("-" * 80)
+                                print(f"\nEstratégia: {strat_name}")
+                                for key, value in signal.items():
+                                    print(f"{key}: {value}")
+                                # Insere os legs do sinal no banco
+                                db.insert_signal_legs(signal_id, signal, bot.asset_min_qty.get(asset, 0.01))
         except Exception as e:
             print(f"Erro na execução do robô: {e}")
 
-        # Verifica os sinais para rolagem com base na proximidade da expiração ou lucro maximizado
-        notifications = db.check_roll_signals(
-            roll_threshold_days=2, profit_threshold=0.75
-        )
-        if notifications:
+        if notifications := db.check_roll_signals(roll_threshold_days=2, profit_threshold=0.75):
             print("\n=== Notificações de Rolagem ===")
             for note in notifications:
                 print(note)
