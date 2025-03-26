@@ -143,6 +143,9 @@ class SignalDatabase:
         :return: ID do sinal inserido ou None.
         """
         if self.signal_exists(asset, strategy, expiration):
+            print(
+                f"Sinal para {asset} - {strategy} com expiração {expiration} já existe. Ignorando duplicata."
+            )
             return None
         cursor = self.conn.cursor()
         cursor.execute(
@@ -684,17 +687,16 @@ if __name__ == "__main__":
             results = bot.run()
             print("\n=== Sinais de Entrada Gerados ===")
             for asset, strategies in results.items():
-                # Para cada estratégia do ativo:
+                print(f"\nAtivo: {asset}/{bot.quote_currency}")
                 for strat_name, (signal, roll_instruction) in strategies.items():
-                    # Se o sinal for de "No Trade" ou "Erro", exibe os detalhes (não são gravados)
-                    if ("No Trade" in signal["strategy"]) or (
-                        "Erro" in signal["strategy"]
+                    print(f"\nEstratégia: {strat_name}")
+                    for key, value in signal.items():
+                        print(f"{key}: {value}")
+                    # Insere o sinal no banco se for válido (não "No Trade" ou "Erro")
+                    if (
+                        "No Trade" not in signal["strategy"]
+                        and "Erro" not in signal["strategy"]
                     ):
-                        print(f"\nEstratégia: {strat_name}")
-                        for key, value in signal.items():
-                            print(f"{key}: {value}")
-                    else:
-                        # Para sinais válidos, tenta inseri-los no banco
                         signal_id = db.insert_signal(
                             asset,
                             signal["strategy"],
@@ -703,17 +705,8 @@ if __name__ == "__main__":
                             signal,
                             roll_instruction,
                         )
-                        if signal_id is None:
-                            # Se já existir, exibe somente a mensagem reduzida
-                            print(
-                                f"\nSinal para {asset} - {signal['strategy']} com expiração {signal.get('expiration', '')} já existe."
-                            )
-                        else:
-                            # Se inserido, exibe os logs detalhados
-                            print(f"\nEstratégia: {strat_name}")
-                            for key, value in signal.items():
-                                print(f"{key}: {value}")
-                            # Insere os legs do sinal no banco
+                        if signal_id is not None:
+                            # Utiliza a quantidade mínima definida para o ativo
                             db.insert_signal_legs(
                                 signal_id, signal, bot.asset_min_qty.get(asset, 0.01)
                             )
