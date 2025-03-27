@@ -136,7 +136,7 @@ class SignalDatabase:
         :param strategy: Estratégia (ex: 'Short Strangle').
         :param expiration: Data de expiração (ex: 'YYYY-MM-DD').
         :param premium: Prêmio total da operação.
-        :param signal_details: Detalhes do sinal (dicionário convertido para JSON), incluindo 'leg_premiums' e 'max_profit'.
+        :param signal_details: Detalhes do sinal (dicionário convertido para JSON), incluindo 'leg_premiums'.
         :param roll_instruction: Instrução de rolagem.
         :return: ID do sinal inserido ou None.
         """
@@ -188,27 +188,16 @@ class SignalDatabase:
                 self.insert_signal_leg(signal_id, leg_key, premium_value, quantity)
 
     def check_roll_signals(self, roll_threshold_days=2, profit_threshold=0.75):
-        """
-        Verifica sinais ativos para identificar se atingiram o limite de expiração, lucro ou se é 21 dias antes do vencimento,
-        e gera notificações com instruções específicas de rolagem. Se um sinal estiver para rolagem,
-        a mensagem informará quais posições (pernas) devem ser fechadas e instruirá a abertura de uma nova posição
-        para a expiração indicada.
-
-        :param roll_threshold_days: Número de dias antes da expiração para iniciar notificação (além da verificação dos 21 dias).
-        :param profit_threshold: Fração do tempo total decorrido para notificar rolagem.
-        :return: Lista de mensagens de notificação.
-        """
         tz = pytz.timezone("America/Recife")
         now = datetime.now(tz)
         cursor = self.conn.cursor()
-        # Inclui signal_details na query para extrair informações sobre as posições abertas.
         cursor.execute(
-            "SELECT id, asset, strategy, expiration, premium, roll_instruction, timestamp, signal_details FROM signals WHERE status = 'active'"
+            "SELECT id, asset, strategy, expiration, premium, roll_instruction, timestamp FROM signals WHERE status = 'active'"
         )
         rows = cursor.fetchall()
         notifications = []
         for row in rows:
-            (signal_id, asset, strategy, expiration, premium, roll_instruction, entry_timestamp, signal_details_str) = row
+            (signal_id, asset, strategy, expiration, premium, roll_instruction, entry_timestamp) = row
             try:
                 exp_date_naive = datetime.strptime(expiration, "%Y-%m-%d")
                 exp_date = tz.localize(exp_date_naive)
@@ -223,55 +212,24 @@ class SignalDatabase:
             elapsed = now - entry_date
             profit_fraction = (elapsed.total_seconds() / total_time.total_seconds() if total_time.total_seconds() > 0 else 0)
             notify_profit = profit_fraction >= profit_threshold
-            # Nova condição: verificar se hoje é exatamente 21 dias antes do vencimento.
-            notify_21 = (exp_date - now).days == 21
 
-            # Extrai os detalhes do sinal para identificar as posições abertas
-            active_legs = []
-            try:
-                signal_details = json.loads(signal_details_str)
-                # Verifica as chaves que indicam posições abertas e captura os símbolos
-                for leg_key in ["sell_call", "sell_put", "buy_call", "buy_put"]:
-                    if leg_key in signal_details:
-                        leg = signal_details[leg_key]
-                        symbol = leg.get("symbol", "N/A")
-                        active_legs.append(f"{leg_key} (símbolo {symbol})")
-            except Exception as e:
-                pass
-
-            # Se qualquer uma das condições for atendida, gera a mensagem de rolagem.
-            if notify_exp or notify_profit or notify_21:
-                # Constrói a mensagem de rolagem detalhada.
-                if active_legs:
-                    new_roll_instruction = (
-                        f"Feche as posições de {', '.join(active_legs)} antes de abrir uma nova posição para a expiração {expiration}."
-                    )
-                else:
-                    new_roll_instruction = roll_instruction
-
-                # Se for o dia exato de 21 dias antes, adiciona essa informação na mensagem.
-                if notify_21:
-                    time_msg = "Hoje é exatamente 21 dias antes do vencimento. "
-                else:
-                    time_msg = ""
-                    
+            if notify_exp or notify_profit:
                 if notify_exp and notify_profit:
                     message = (
                         f"Signal ID {signal_id} ({asset} - {strategy}) está próximo da expiração ({expiration}) "
-                        f"e atingiu {profit_fraction*100:.1f}% do tempo decorrido. {time_msg}{new_roll_instruction}"
+                        f"e atingiu {profit_fraction*100:.1f}% do tempo decorrido. "
+                        f"Instrução de Rolagem: {roll_instruction}"
                     )
                 elif notify_exp:
                     message = (
-                        f"Signal ID {signal_id} ({asset} - {strategy}) está próximo da expiração ({expiration}). {time_msg}{new_roll_instruction}"
-                    )
-                elif notify_profit:
-                    message = (
-                        f"Signal ID {signal_id} ({asset} - {strategy}) atingiu {profit_fraction*100:.1f}% do tempo decorrido "
-                        f"(indicativo de lucro máximo). {time_msg}{new_roll_instruction}"
+                        f"Signal ID {signal_id} ({asset} - {strategy}) está próximo da expiração ({expiration}). "
+                        f"Instrução de Rolagem: {roll_instruction}"
                     )
                 else:
-                    message = new_roll_instruction
-
+                    message = (
+                        f"Signal ID {signal_id} ({asset} - {strategy}) atingiu {profit_fraction*100:.1f}% do tempo decorrido "
+                        f"(indicativo de lucro máximo). Instrução de Rolagem: {roll_instruction}"
+                    )
                 notifications.append(message)
                 cursor.execute("UPDATE signals SET status = 'rolled' WHERE id = ?", (signal_id,))
         self.conn.commit()
@@ -412,44 +370,6 @@ class OptionStrategyBot:
             print(f"Erro ao calcular T para expiração {expiration}: {e}")
             return 0
 
-    def calculate_max_profit(self, strategy, signal, T):
-        """
-        Calcula o máximo potencial de lucro na abertura do sinal.
-        Para Short Strangle, o lucro máximo é o crédito recebido.
-        Para Bull Call Spread, é a diferença entre strikes menos o crédito.
-        Para Bear Put Spread, é a diferença entre strikes menos o crédito.
-        Essa função é aplicada apenas nas estratégias sem prazo fixo determinado (não 16 Delta Short Strangle).
-
-        :param strategy: Nome da estratégia.
-        :param signal: Dicionário do sinal gerado.
-        :param T: Tempo até expiração (anos).
-        :return: Valor máximo potencial de lucro.
-        """
-        if strategy == "Short Strangle":
-            # Máximo lucro é o crédito total recebido.
-            return signal.get("premium", 0)
-        elif strategy == "Bull Call Spread":
-            # Lucro máximo = (Strike da call comprada - Strike da call vendida) - crédito recebido.
-            sold_call = signal.get("sell_call", {})
-            bought_call = signal.get("buy_call", {})
-            net_credit = signal.get("premium", 0)
-            if sold_call and bought_call:
-                spread_width = bought_call.get("strike", 0) - sold_call.get("strike", 0)
-                return max(spread_width - net_credit, 0)
-            return 0
-        elif strategy == "Bear Put Spread":
-            # Lucro máximo = (Strike da put vendida - Strike da put comprada) - crédito recebido.
-            sold_put = signal.get("sell_put", {})
-            bought_put = signal.get("buy_put", {})
-            net_credit = signal.get("premium", 0)
-            if sold_put and bought_put:
-                spread_width = sold_put.get("strike", 0) - bought_put.get("strike", 0)
-                return max(spread_width - net_credit, 0)
-            return 0
-        else:
-            # Estratégias com prazo fixo (ex.: 16 Delta Short Strangle) não usam essa técnica.
-            return None
-
     def analyze_and_generate_short_strangle(self, asset):
         """
         Analisa o ativo para gerar sinais de Short Strangle para todos os vencimentos
@@ -555,9 +475,6 @@ class OptionStrategyBot:
                     "leg_premiums": {},
                     "rationale": "Opções OTM não disponíveis."
                 }
-            # Calcula o máximo potencial de lucro para esta estratégia
-            max_profit = self.calculate_max_profit("Short Strangle", signal, T)
-            signal["max_profit"] = max_profit
             signals_list.append((signal, roll_instruction))
         return signals_list
 
@@ -672,9 +589,6 @@ class OptionStrategyBot:
                             "leg_premiums": leg_premiums,
                             "rationale": f"Crédito líquido: {net_credit:.4f}."
                         }
-                # Calcula o máximo potencial de lucro para Bull Call Spread
-                max_profit = self.calculate_max_profit("Bull Call Spread", signal, T)
-                signal["max_profit"] = max_profit
             else:
                 roll_instruction = ""
                 signal = {
@@ -799,9 +713,6 @@ class OptionStrategyBot:
                             "leg_premiums": leg_premiums,
                             "rationale": f"Crédito líquido: {net_credit:.4f}."
                         }
-                # Calcula o máximo potencial de lucro para Bear Put Spread
-                max_profit = self.calculate_max_profit("Bear Put Spread", signal, T)
-                signal["max_profit"] = max_profit
             else:
                 roll_instruction = ""
                 signal = {
@@ -823,7 +734,7 @@ class OptionStrategyBot:
           - Venda simultânea de uma call e uma put com delta aproximado de 16% (ou seja, opções OTM).
           - Vencimento fixo de 45 dias a contar da abertura.
           - Possibilidade de diversificação temporal: abertura de posições 5 dias antes e 5 dias depois.
-          - Rolagem: Iniciar rolagem 21 dias antes do vencimento.
+          - Rolagem: Iniciar 21 dias antes do vencimento para evitar risco de gamma.
           - Margem de manutenção: Até 50% (com tolerância de 10%, até 55%), ou entre 35 a 40% se a volatilidade implícita estiver baixa.
           - Realização de lucros: Renda perpétua com rolagem ou encerramento quando as opções atingirem 65% de ROI.
         
@@ -833,7 +744,7 @@ class OptionStrategyBot:
         tz = pytz.timezone("America/Recife")
         now = datetime.now(tz)
         signals_list = []
-        # Definindo vencimentos fixos: 45 dias, 40 dias e 50 dias a partir de hoje.
+        # Definindo vencimentos: principal 45 dias, diversificados 40 e 50 dias a partir de hoje.
         expirations = [
             (now + timedelta(days=45)).strftime("%Y-%m-%d"),
             (now + timedelta(days=40)).strftime("%Y-%m-%d"),
